@@ -113,9 +113,12 @@ def compute_auto_weights_for_points(points_bl, gear_type, bone_mode="AUTO"):
         groups[bone_mode] = {i: 1.0 for i in range(num_pts)}
         return groups
 
-    if bone_mode == "AUTO" and gear_type in ("HEADGEAR", "GOGGLES", "FACE"):
+    if bone_mode == "AUTO" and gear_type in ("HEADGEAR", "GOGGLES", "FACE", "NVG"):
         groups["head"] = {i: 1.0 for i in range(num_pts)}
         return groups
+
+    vest_allowed = {"spine3", "spine2", "spine1", "spine", "pelvis", "neck"}
+    backpack_allowed = {"spine3", "spine2", "spine1", "pelvis"}
 
     if os.path.exists(MANNEQUIN_PATH):
         m_verts, _, _, m_sels = load_mlod_lod0_data(MANNEQUIN_PATH)
@@ -128,26 +131,83 @@ def compute_auto_weights_for_points(points_bl, gear_type, bone_mode="AUTO"):
             groups[bname] = {}
 
         for vi, pt in enumerate(points_bl):
-            nearest = kd.find_n(Vector(pt), 6)
-            # Inverse distance weighting
-            total_inv = 0.0
-            inv_list = []
-            for co, m_idx, dist in nearest:
-                inv = 1.0 / (max(dist, 0.0005) ** 2)
-                inv_list.append((m_idx, inv))
-                total_inv += inv
+            is_left_side = pt[0] > 0.025
+            is_right_side = pt[0] < -0.025
 
-            bone_accum = {}
-            for m_idx, inv in inv_list:
-                factor = inv / total_inv
+            nearest = kd.find_n(Vector(pt), 3)
+            # If extremely close (< 5mm), snap directly without blurring
+            if nearest and nearest[0][2] < 0.005:
+                closest_idx = nearest[0][1]
                 for bname, bmap in m_sels.items():
-                    mw = bmap.get(m_idx, 0.0)
-                    if mw > 0.0:
-                        bone_accum[bname] = bone_accum.get(bname, 0.0) + mw * factor
+                    bn_l = bname.lower()
+                    if gear_type == "VEST" and bn_l not in vest_allowed:
+                        continue
+                    if gear_type == "BACKPACK" and bn_l not in backpack_allowed:
+                        continue
+                    if is_left_side and (bn_l.startswith("right") or "righthand" in bn_l):
+                        continue
+                    if is_right_side and (bn_l.startswith("left") or "lefthand" in bn_l):
+                        continue
+                    w = bmap.get(closest_idx, 0.0)
+                    if w > 0.01:
+                        groups[bname][vi] = w
+            else:
+                # Inverse distance weighting with power 3 for sharp localized weights
+                total_inv = 0.0
+                inv_list = []
+                for co, m_idx, dist in nearest:
+                    inv = 1.0 / (max(dist, 0.001) ** 3)
+                    inv_list.append((m_idx, inv))
+                    total_inv += inv
 
-            for bname, final_w in bone_accum.items():
-                if final_w > 0.02:
-                    groups[bname][vi] = min(1.0, final_w)
+                bone_accum = {}
+                for m_idx, inv in inv_list:
+                    factor = inv / total_inv
+                    for bname, bmap in m_sels.items():
+                        bn_l = bname.lower()
+                        if gear_type == "VEST" and bn_l not in vest_allowed:
+                            continue
+                        if gear_type == "BACKPACK" and bn_l not in backpack_allowed:
+                            continue
+                        if is_left_side and (bn_l.startswith("right") or "righthand" in bn_l):
+                            continue
+                        if is_right_side and (bn_l.startswith("left") or "lefthand" in bn_l):
+                            continue
+                        mw = bmap.get(m_idx, 0.0)
+                        if mw > 0.0:
+                            bone_accum[bname] = bone_accum.get(bname, 0.0) + mw * factor
+
+                for bname, final_w in bone_accum.items():
+                    if final_w > 0.02:
+                        groups[bname][vi] = final_w
+
+            # If all bones were filtered out, assign sensible fallback
+            has_w = any(vi in vmap for bname, vmap in groups.items() if bname != "camo")
+            if not has_w:
+                if gear_type in ("VEST", "BACKPACK"):
+                    groups.setdefault("spine3", {})[vi] = 1.0
+                else:
+                    groups.setdefault("pelvis", {})[vi] = 1.0
+
+        # Enforce max 4 bones per point and normalize so sum of bone weights is 1.0
+        all_bone_names = [b for b in groups.keys() if b != "camo"]
+        for vi in range(num_pts):
+            pt_bones = []
+            for bname in all_bone_names:
+                w = groups[bname].get(vi, 0.0)
+                if w > 0.001:
+                    pt_bones.append((bname, w))
+            if not pt_bones:
+                continue
+            pt_bones.sort(key=lambda x: x[1], reverse=True)
+            top = pt_bones[:4]
+            tw = sum(w for _, w in top)
+            if tw > 1e-6:
+                for bname, w in top:
+                    groups[bname][vi] = round(w / tw, 4)
+            for bname, _ in pt_bones[4:]:
+                if vi in groups[bname]:
+                    del groups[bname][vi]
 
         # Clean empty groups
         groups = {k: v for k, v in groups.items() if v}
@@ -1142,6 +1202,165 @@ def bind_mesh_to_arma3_skeleton(mesh_obj, arm_obj):
     mod.use_vertex_groups = True
 
 
+VEST_ALLOWED_BONES = {"spine3", "spine2", "spine1", "spine", "pelvis", "neck"}
+BACKPACK_ALLOWED_BONES = {"spine3", "spine2", "spine1", "pelvis"}
+HEAD_SLOTS = {"HEADGEAR", "GOGGLES", "FACE", "NVG"}
+
+
+def normalize_and_limit_bone_weights(obj, max_bones=4):
+    """
+    Normalizes bone vertex weights so their sum is exactly 1.0, and enforces maximum 4 bones per vertex (Arma 3 limit).
+    Completely ignores 'camo' and other non-bone groups so their 1.0 weight is never halved.
+    """
+    if not obj or obj.type != "MESH":
+        return
+    bone_group_indices = {
+        vg.index for vg in obj.vertex_groups
+        if vg.name.lower() in ARMA3_BONE_NAMES_SET and vg.name.lower() != "camo"
+    }
+    if not bone_group_indices:
+        return
+
+    for v in obj.data.vertices:
+        bone_entries = []
+        for g in v.groups:
+            if g.group in bone_group_indices and g.weight > 0.0001:
+                bone_entries.append((g.group, g.weight))
+        if not bone_entries:
+            continue
+        bone_entries.sort(key=lambda x: x[1], reverse=True)
+        top = bone_entries[:max_bones]
+        total_w = sum(w for _, w in top)
+        if total_w > 1e-6:
+            for gid, w in top:
+                obj.vertex_groups[gid].add([v.index], w / total_w, "REPLACE")
+        for gid, _ in bone_entries[max_bones:]:
+            obj.vertex_groups[gid].remove([v.index])
+
+
+def clean_and_normalize_gear_weights(
+    obj,
+    gear_type="UNIFORM",
+    bone_mode="AUTO",
+    protect_bilateral=True,
+    filter_slot=True,
+    arm_obj=None,
+):
+    """
+    Post-processes transferred weights to eliminate stretching, cross-limb bleeding, and chewing-gum bugs:
+    1. Slot filtering (Helmets/Glasses -> 100% head; Vests/Backpacks -> spine/pelvis only, no arms/legs).
+    2. Bilateral X-isolation (Left side vertices never have right-side bones, and vice versa).
+    3. Fills orphan vertices with sensible fallback bones based on Z height.
+    4. Limits to top 4 bones and normalizes bone weights (strictly preserves 'camo' at 1.0).
+    """
+    if not obj or obj.type != "MESH":
+        return
+
+    # 0. Sanitize: remove alien non-Arma vertex groups (ValveBiped, CC_Base, j_, mixamorig, etc.)
+    for vg in list(obj.vertex_groups):
+        vgl = vg.name.lower()
+        if vgl not in ARMA3_BONE_NAMES_SET and not vgl.startswith("camo"):
+            obj.vertex_groups.remove(vg)
+
+    # Clean dead armature modifiers without target object
+    for m in list(obj.modifiers):
+        if m.type == "ARMATURE" and m.object is None:
+            obj.modifiers.remove(m)
+
+    mw = obj.matrix_world
+
+    # 1. Rigid head slots
+    if gear_type in HEAD_SLOTS or bone_mode == "head":
+        for vg in list(obj.vertex_groups):
+            if vg.name.lower() in ARMA3_BONE_NAMES_SET and vg.name.lower() != "head":
+                obj.vertex_groups.remove(vg)
+        head_vg = obj.vertex_groups.get("head") or obj.vertex_groups.new(name="head")
+        if len(obj.data.vertices) > 0:
+            head_vg.add(list(range(len(obj.data.vertices))), 1.0, "REPLACE")
+        vg_camo = obj.vertex_groups.get("camo")
+        if not vg_camo:
+            vg_camo = obj.vertex_groups.get("camo") or obj.vertex_groups.new(name="camo")
+            if len(obj.data.vertices) > 0:
+                vg_camo.add(list(range(len(obj.data.vertices))), 1.0, "REPLACE")
+        return
+
+    # 2. VEST slot filtering
+    if gear_type == "VEST" and filter_slot and bone_mode in ("AUTO", "MANNEQUIN_KD"):
+        for vg in list(obj.vertex_groups):
+            nl = vg.name.lower()
+            if nl in ARMA3_BONE_NAMES_SET and nl not in VEST_ALLOWED_BONES:
+                obj.vertex_groups.remove(vg)
+
+    # 3. BACKPACK slot filtering
+    if gear_type == "BACKPACK" and filter_slot and bone_mode in ("AUTO", "MANNEQUIN_KD"):
+        for vg in list(obj.vertex_groups):
+            nl = vg.name.lower()
+            if nl in ARMA3_BONE_NAMES_SET and nl not in BACKPACK_ALLOWED_BONES:
+                obj.vertex_groups.remove(vg)
+
+    # 4. Bilateral X protection (Left limbs don't bleed into Right limbs)
+    if protect_bilateral and gear_type not in HEAD_SLOTS:
+        r_verts = [v.index for v in obj.data.vertices if (mw @ v.co).x < -0.025]
+        l_verts = [v.index for v in obj.data.vertices if (mw @ v.co).x > 0.025]
+        for vg in list(obj.vertex_groups):
+            nl = vg.name.lower()
+            if nl.startswith("left") or "lefthand" in nl:
+                if r_verts:
+                    vg.remove(r_verts)
+            elif nl.startswith("right") or "righthand" in nl:
+                if l_verts:
+                    vg.remove(l_verts)
+
+    # 5. Fix orphan vertices (ensure every single vertex has at least 1 valid bone)
+    bone_vgs = [vg for vg in obj.vertex_groups if vg.name.lower() in ARMA3_BONE_NAMES_SET and vg.name.lower() != "camo"]
+    if bone_vgs:
+        # Determine Z reference from skeleton or mesh bounds
+        z_s3 = 1.18
+        z_s2 = 1.02
+        if arm_obj and arm_obj.data:
+            b3 = arm_obj.data.bones.get("spine3")
+            b2 = arm_obj.data.bones.get("spine2")
+            if b3:
+                z_s3 = (arm_obj.matrix_world @ b3.head_local).z
+            if b2:
+                z_s2 = (arm_obj.matrix_world @ b2.head_local).z
+
+        vg_spine3 = obj.vertex_groups.get("spine3") or obj.vertex_groups.new(name="spine3")
+        vg_spine2 = obj.vertex_groups.get("spine2") or obj.vertex_groups.new(name="spine2")
+        vg_pelvis = obj.vertex_groups.get("pelvis") or obj.vertex_groups.new(name="pelvis")
+
+        for v in obj.data.vertices:
+            has_w = False
+            for vg in bone_vgs:
+                try:
+                    if vg.weight(v.index) > 0.001:
+                        has_w = True
+                        break
+                except RuntimeError:
+                    pass
+            if not has_w:
+                w_co = mw @ v.co
+                if gear_type in ("VEST", "BACKPACK"):
+                    if w_co.z >= z_s3:
+                        vg_spine3.add([v.index], 1.0, "REPLACE")
+                    elif w_co.z <= z_s2:
+                        vg_spine2.add([v.index], 1.0, "REPLACE")
+                    else:
+                        t = (w_co.z - z_s2) / max(0.01, (z_s3 - z_s2))
+                        vg_spine3.add([v.index], float(t), "REPLACE")
+                        vg_spine2.add([v.index], float(1.0 - t), "REPLACE")
+                else:
+                    vg_pelvis.add([v.index], 1.0, "REPLACE")
+
+    # 6. Normalize bone weights and limit to 4 bones per vertex
+    normalize_and_limit_bone_weights(obj, max_bones=4)
+
+    # 7. Ensure 'camo' selection covers 100% of vertices with weight 1.0
+    vg_camo = obj.vertex_groups.get("camo") or obj.vertex_groups.new(name="camo")
+    if len(obj.data.vertices) > 0:
+        vg_camo.add(list(range(len(obj.data.vertices))), 1.0, "REPLACE")
+
+
 class EZMOD_OT_spawn_mannequin(bpy.types.Operator):
     bl_idname = "ezmod.spawn_mannequin"
     bl_label = "👤 Спавн манекена + Скелет Arma 3"
@@ -1328,6 +1547,13 @@ class EZMOD_OT_weight_paint_mode(bpy.types.Operator):
         arm = ensure_arma3_skeleton(context)
         bind_mesh_to_arma3_skeleton(obj, arm)
 
+        # Ensure skeleton is visible, sticks display and in front
+        arm.hide_viewport = False
+        arm.hide_set(False)
+        arm.show_in_front = True
+        if arm.data:
+            arm.data.display_type = 'STICK'
+
         # Ensure vertex groups exist before entering Weight Paint
         has_arma_vg = any(vg.name in ARMA3_BONE_NAMES_SET for vg in obj.vertex_groups)
         if not has_arma_vg:
@@ -1337,7 +1563,14 @@ class EZMOD_OT_weight_paint_mode(bpy.types.Operator):
         arm.select_set(True)
         obj.select_set(True)
         context.view_layer.objects.active = obj
-        bpy.ops.object.mode_set(mode="WEIGHT_GPENCIL" if False else "WEIGHT_PAINT")
+        bpy.ops.object.mode_set(mode="WEIGHT_PAINT")
+
+        # Enable vertex masking and front-faces only
+        obj.data.use_paint_mask_vertex = True
+        context.tool_settings.use_auto_normalize = True
+        wp_brush = getattr(getattr(context.tool_settings, "weight_paint", None), "brush", None)
+        if wp_brush:
+            wp_brush.use_frontface = True
 
         # Select spine3 or head active group for convenience
         props = context.scene.ez_mod_props
@@ -1348,7 +1581,7 @@ class EZMOD_OT_weight_paint_mode(bpy.types.Operator):
 
         self.report(
             {"INFO"},
-            "Режим Weight Paint включён! Меняй кости во вкладке Vertex Groups (или Ctrl+ЛКМ по кости) и правь веса кистью.",
+            "Идеальный Weight Paint! Кости тонкие (STICK): Ctrl+ЛКМ = выбор, R = согнуть кость, L = выделить палец, H = спрятать лишнее.",
         )
         return {"FINISHED"}
 
@@ -1834,20 +2067,14 @@ class EZMOD_OT_auto_fit_gloves(bpy.types.Operator):
         bpy.ops.object.datalayout_transfer(modifier=dt_mod.name)
         bpy.ops.object.modifier_apply(modifier=dt_mod.name)
 
-        vg_camo = obj.vertex_groups.get("camo") or obj.vertex_groups.new(name="camo")
-        vg_camo.add(list(range(len(obj.data.vertices))), 1.0, "REPLACE")
+        vg_camo = obj.vertex_groups.get("camo")
+        if not vg_camo:
+            vg_camo = obj.vertex_groups.get("camo") or obj.vertex_groups.new(name="camo")
+            if len(obj.data.vertices) > 0:
+                vg_camo.add(list(range(len(obj.data.vertices))), 1.0, "REPLACE")
 
         bind_mesh_to_arma3_skeleton(obj, arm)
-        try:
-            if len(obj.vertex_groups) > 0:
-                obj.vertex_groups.active_index = 0
-            bpy.ops.object.mode_set(mode="WEIGHT_PAINT")
-            bpy.ops.object.vertex_group_limit_total(group_select_mode="BONE_DEFORM", limit=4)
-            bpy.ops.object.vertex_group_normalize_all(group_select_mode="BONE_DEFORM", lock_active=False)
-            bpy.ops.object.mode_set(mode="OBJECT")
-        except Exception:
-            if context.mode != "OBJECT":
-                bpy.ops.object.mode_set(mode="OBJECT")
+        normalize_and_limit_bone_weights(obj, max_bones=4)
 
         self.report(
             {"INFO"},
@@ -1877,166 +2104,106 @@ class EZMOD_OT_auto_rig(bpy.types.Operator):
         props = context.scene.ez_mod_props
         arm = ensure_arma3_skeleton(context)
 
-        # Save & reset skeleton pose temporarily so rest-pose weight transfer is accurate
-        saved_pose = {}
-        if arm and arm.pose:
-            for pb in arm.pose.bones:
-                saved_pose[pb.name] = (
-                    pb.rotation_mode,
-                    tuple(pb.rotation_euler),
-                    tuple(pb.rotation_quaternion),
-                    tuple(pb.location),
-                )
-                pb.rotation_euler = (0.0, 0.0, 0.0)
-                pb.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
-                pb.location = (0.0, 0.0, 0.0)
-
-        # Clear old Arma bone weights so re-running Auto-Rig gives a fresh clean rig
-        for vg in list(obj.vertex_groups):
-            if vg.name.lower() in ARMA3_BONE_NAMES_SET or vg.name.lower().startswith("camo"):
-                obj.vertex_groups.remove(vg)
-
-        used_rwt = False
-        rwt_error = None
-        use_surface_transfer = (
-            props.rig_bone_mode in ("AUTO", "MANNEQUIN_KD")
-            and props.gear_type not in ("HEADGEAR", "GOGGLES", "FACE")
-            and hasattr(context.scene, "robust_weight_transfer_settings")
-            and hasattr(bpy.ops.object, "skin_weight_transfer")
-        )
-
-        if use_surface_transfer:
-            mannequin = bpy.data.objects.get("Arma3_Mannequin")
-            if mannequin is None:
-                try:
-                    bpy.ops.ezmod.spawn_mannequin()
-                    mannequin = bpy.data.objects.get("Arma3_Mannequin")
-                except Exception:
-                    mannequin = None
-
-            if mannequin is not None and mannequin.type == "MESH":
-                man_was_hidden = mannequin.hide_get()
-                mannequin.hide_set(False)
-                bind_mesh_to_arma3_skeleton(mannequin, arm)
-                try:
-                    bpy.ops.object.select_all(action="DESELECT")
-                    obj.select_set(True)
-                    context.view_layer.objects.active = obj
-                    rwt = context.scene.robust_weight_transfer_settings
-                    rwt.source_object = mannequin
-                    rwt.apply_to_selected = False
-                    if hasattr(rwt, "group_selection"):
-                        rwt.group_selection = "DEFORM_POSE_BONES"
-                    if hasattr(rwt, "max_distance"):
-                        rwt.max_distance = max(rwt.max_distance, 0.25)
-                    if hasattr(rwt, "max_normal_angle_difference"):
-                        import math
-                        rwt.max_normal_angle_difference = math.pi
-                    context.view_layer.update()
-                    if bpy.ops.object.skin_weight_transfer.poll():
-                        res = bpy.ops.object.skin_weight_transfer()
-                        if "FINISHED" in res:
-                            used_rwt = True
-                except Exception as exc:
-                    rwt_error = str(exc)
-                finally:
-                    mannequin.hide_set(man_was_hidden)
-
-        if used_rwt:
-            bind_mesh_to_arma3_skeleton(obj, arm)
-            # Smooth + limit to 4 bones per vertex (Arma 3 limit) before adding 'camo'
-            try:
-                if len(obj.vertex_groups) > 0:
-                    obj.vertex_groups.active_index = 0
-                bpy.ops.object.mode_set(mode="WEIGHT_PAINT")
-                bpy.ops.object.vertex_group_smooth(
-                    group_select_mode="BONE_DEFORM",
-                    factor=0.35,
-                    repeat=2,
-                    expand=0.0,
-                )
-                bpy.ops.object.vertex_group_limit_total(
-                    group_select_mode="BONE_DEFORM",
-                    limit=4,
-                )
-                bpy.ops.object.vertex_group_normalize_all(
-                    group_select_mode="BONE_DEFORM",
-                    lock_active=False,
-                )
-                bpy.ops.object.mode_set(mode="OBJECT")
-            except Exception:
-                if context.mode != "OBJECT":
-                    try:
-                        bpy.ops.object.mode_set(mode="OBJECT")
-                    except Exception:
-                        pass
-            vg_camo = obj.vertex_groups.get("camo") or obj.vertex_groups.new(name="camo")
-            vg_camo.add(list(range(len(obj.data.vertices))), 1.0, "REPLACE")
-            bones_list = ", ".join(
-                vg.name for vg in obj.vertex_groups if vg.name.lower() in ARMA3_BONE_NAMES_SET
-            )
-        else:
-            # Temporarily disable armature modifier while sampling rest-pose world positions
-            disabled_mods = []
-            for m in obj.modifiers:
-                if m.type == "ARMATURE" and m.show_viewport:
-                    m.show_viewport = False
-                    disabled_mods.append(m)
+        # Force rest pose (T-pose) during weight transfer so bent pose never distorts transfer
+        prev_pose_pos = arm.data.pose_position if (arm and arm.data) else None
+        if arm and arm.data:
+            arm.data.pose_position = "REST"
             context.view_layer.update()
 
-            mw = obj.matrix_world
-            pts_bl = [tuple(mw @ v.co) for v in obj.data.vertices]
-            weights_map = compute_auto_weights_for_points(pts_bl, props.gear_type, bone_mode=props.rig_bone_mode)
+        try:
+            # Clear old Arma bone weights so re-running Auto-Rig gives a fresh clean rig
+            for vg in list(obj.vertex_groups):
+                if vg.name.lower() in ARMA3_BONE_NAMES_SET:
+                    obj.vertex_groups.remove(vg)
 
-            # Write vertex groups onto the Blender object
-            for bname, vmap in weights_map.items():
-                vg = obj.vertex_groups.get(bname) or obj.vertex_groups.new(name=bname)
-                for vi, w in vmap.items():
-                    vg.add([vi], w, "REPLACE")
+            used_rwt = False
+            use_surface_transfer = (
+                props.rig_bone_mode in ("AUTO", "MANNEQUIN_KD")
+                and props.gear_type not in HEAD_SLOTS
+                and hasattr(context.scene, "robust_weight_transfer_settings")
+                and hasattr(bpy.ops.object, "skin_weight_transfer")
+            )
 
-            for m in disabled_mods:
-                m.show_viewport = True
+            if use_surface_transfer:
+                mannequin = bpy.data.objects.get("Arma3_Mannequin")
+                if mannequin is None:
+                    try:
+                        bpy.ops.ezmod.spawn_mannequin()
+                        mannequin = bpy.data.objects.get("Arma3_Mannequin")
+                    except Exception:
+                        mannequin = None
 
+                if mannequin is not None and mannequin.type == "MESH":
+                    man_was_hidden = mannequin.hide_get()
+                    mannequin.hide_set(False)
+                    bind_mesh_to_arma3_skeleton(mannequin, arm)
+                    try:
+                        bpy.ops.object.select_all(action="DESELECT")
+                        obj.select_set(True)
+                        context.view_layer.objects.active = obj
+                        rwt = context.scene.robust_weight_transfer_settings
+                        rwt.source_object = mannequin
+                        rwt.apply_to_selected = False
+                        if hasattr(rwt, "group_selection"):
+                            rwt.group_selection = "DEFORM_POSE_BONES"
+                        if hasattr(rwt, "max_distance"):
+                            rwt.max_distance = 0.15
+                        if hasattr(rwt, "max_normal_angle_difference"):
+                            import math
+                            rwt.max_normal_angle_difference = math.radians(75.0)
+                        context.view_layer.update()
+                        if bpy.ops.object.skin_weight_transfer.poll():
+                            res = bpy.ops.object.skin_weight_transfer()
+                            if "FINISHED" in res:
+                                used_rwt = True
+                    except Exception:
+                        used_rwt = False
+                    finally:
+                        mannequin.hide_set(man_was_hidden)
+
+            if not used_rwt:
+                mw = obj.matrix_world
+                pts_bl = [tuple(mw @ v.co) for v in obj.data.vertices]
+                weights_map = compute_auto_weights_for_points(pts_bl, props.gear_type, bone_mode=props.rig_bone_mode)
+
+                # Write vertex groups onto the Blender object
+                for bname, vmap in weights_map.items():
+                    vg = obj.vertex_groups.get(bname) or obj.vertex_groups.new(name=bname)
+                    for vi, w in vmap.items():
+                        vg.add([vi], w, "REPLACE")
+
+            # Clean slot filtering, bilateral X protection, limit 4 bones, and normalize cleanly
+            clean_and_normalize_gear_weights(
+                obj,
+                gear_type=props.gear_type,
+                bone_mode=props.rig_bone_mode,
+                protect_bilateral=True,
+                filter_slot=True,
+                arm_obj=arm,
+            )
+
+            # Bind to Arma3_Skeleton so posing moves the gear alongside the mannequin
             bind_mesh_to_arma3_skeleton(obj, arm)
-            if props.rig_bone_mode in ("AUTO", "MANNEQUIN_KD") and props.gear_type not in ("HEADGEAR", "GOGGLES", "FACE"):
-                try:
-                    if len(obj.vertex_groups) > 0:
-                        obj.vertex_groups.active_index = 0
-                    bpy.ops.object.mode_set(mode="WEIGHT_PAINT")
-                    bpy.ops.object.vertex_group_smooth(
-                        group_select_mode="BONE_DEFORM",
-                        factor=0.4,
-                        repeat=2,
-                    )
-                    bpy.ops.object.vertex_group_limit_total(
-                        group_select_mode="BONE_DEFORM",
-                        limit=4,
-                    )
-                    bpy.ops.object.vertex_group_normalize_all(
-                        group_select_mode="BONE_DEFORM",
-                        lock_active=False,
-                    )
-                    bpy.ops.object.mode_set(mode="OBJECT")
-                except Exception:
-                    if context.mode != "OBJECT":
-                        try:
-                            bpy.ops.object.mode_set(mode="OBJECT")
-                        except Exception:
-                            pass
-            bones_list = ", ".join(weights_map.keys())
 
-        # Bind to Arma3_Skeleton so posing moves the gear alongside the mannequin
-        bind_mesh_to_arma3_skeleton(obj, arm)
+            # Also enable ArmaToolbox properties nicely
+            if hasattr(obj, "armaObjProps"):
+                obj.armaObjProps.isArmaObject = True
 
-        # Restore previous pose on Arma3_Skeleton so user sees deformation immediately
-        if arm and arm.pose and saved_pose:
-            for pb in arm.pose.bones:
-                if pb.name in saved_pose:
-                    rmode, reul, rquat, rloc = saved_pose[pb.name]
-                    pb.rotation_mode = rmode
-                    pb.rotation_euler = reul
-                    pb.rotation_quaternion = rquat
-                    pb.location = rloc
+        finally:
+            # Restore pose position so user sees deformation in tested pose immediately
+            if arm and arm.data and prev_pose_pos:
+                arm.data.pose_position = prev_pose_pos
+                context.view_layer.update()
+
+        bones_list = ", ".join(
+            vg.name for vg in obj.vertex_groups if vg.name.lower() in ARMA3_BONE_NAMES_SET
+        )
+        method_lbl = "Robust Weight Transfer" if used_rwt else "Auto-Weights (KD-Tree)"
+        self.report(
+            {"INFO"},
+            f"Готово ({method_lbl})! Кости: {bones_list or 'head'}.",
+        )
+        return {"FINISHED"}
 
         # Also enable ArmaToolbox properties nicely
         if hasattr(obj, "armaObjProps"):
@@ -3052,6 +3219,13 @@ def draw_ez_mod_ui(layout, context):
     row_stats.prop(props, "mass_val", text="Масса")
 
     col_tools = box2.column(align=True)
+    col_tools.scale_y = 1.2
+    col_tools.operator("ezmod.ultimate_auto_rig", text="🚀 1 Клик: УЛЬТИМАТИВНЫЙ РИГ", icon="AUTO")
+    row_rig_sub = col_tools.row(align=True)
+    row_rig_sub.operator("ezmod.auto_rig", text="🧲 Авто-Риг", icon="MOD_VERTEX_WEIGHT")
+    row_rig_sub.operator("ezmod.auto_rig_vest_rigid", text="🛡 Плитник", icon="SHIELD")
+    row_rig_sub.operator("ezmod.purge_alien_bones", text="🧹 Снять чужие кости", icon="TRASH")
+    col_tools.scale_y = 1.0
     col_tools.operator("ezmod.fix_multi_uv", icon="UV")
     col_tools.operator("ezmod.adapt_dxt5nm_normals", icon="IMAGE_DATA")
     if obj and obj.active_material:
@@ -3063,7 +3237,6 @@ def draw_ez_mod_ui(layout, context):
     else:
         col_tools.operator("ezmod.make_glass_node", icon="SHADING_RENDERED")
     col_tools.operator("ezmod.auto_fit_gloves", icon="VIEW_PAN")
-    col_tools.operator("ezmod.auto_rig", icon="MOD_VERTEX_WEIGHT")
     wp_text = "🚪 Выйти из Weight Paint" if context.mode == "PAINT_WEIGHT" else "🖌 Править веса кистью (Weight Paint)"
     col_tools.operator("ezmod.weight_paint_mode", text=wp_text, icon="BRUSH_DATA")
 
@@ -3271,6 +3444,10 @@ class EZMOD_OT_sent_transfer_selected(bpy.types.Operator):
             return {"CANCELLED"}
 
         src_arm = next((m.object for m in src.modifiers if m.type == "ARMATURE" and m.object), None)
+        prev_pose_pos = src_arm.data.pose_position if (src_arm and src_arm.data) else None
+        if src_arm and src_arm.data:
+            src_arm.data.pose_position = "REST"
+
         mask_vg = obj.vertex_groups.new(name="__EZ_SEL_MASK")
         mask_vg.add(sel_indices, 1.0, "REPLACE")
 
@@ -3292,12 +3469,18 @@ class EZMOD_OT_sent_transfer_selected(bpy.types.Operator):
             dt_mod.vertex_group = mask_vg.name
             bpy.ops.object.datalayout_transfer(modifier=dt_mod.name)
             bpy.ops.object.modifier_apply(modifier=dt_mod.name)
-            if src_arm:
-                bind_mesh_to_arma3_skeleton(obj, src_arm)
+            target_arm = src_arm or bpy.data.objects.get("Arma3_Skeleton") or ensure_arma3_skeleton(context)
+            if target_arm:
+                bind_mesh_to_arma3_skeleton(obj, target_arm)
+
+            normalize_and_limit_bone_weights(obj, max_bones=4)
         finally:
             if mask_vg.name in obj.vertex_groups:
                 obj.vertex_groups.remove(obj.vertex_groups[mask_vg.name])
             src.hide_set(src_was_hidden)
+            if src_arm and src_arm.data and prev_pose_pos:
+                src_arm.data.pose_position = prev_pose_pos
+                context.view_layer.update()
 
         if prev_mode == "WEIGHT_PAINT":
             if src_arm:
@@ -3679,7 +3862,7 @@ class EZMOD_OT_sent_smart_transfer(bpy.types.Operator):
             self.report({"ERROR"}, "Выберите Source (донора) в поле Source выше или заспавните манекен!")
             return {"CANCELLED"}
 
-        # Find source armature (if any) and temporarily reset pose
+        # Find source armature (if any) and force rest pose during transfer
         src_arm = None
         for m in src.modifiers:
             if m.type == "ARMATURE" and m.object:
@@ -3689,26 +3872,18 @@ class EZMOD_OT_sent_smart_transfer(bpy.types.Operator):
             src_arm = ensure_arma3_skeleton(context)
             bind_mesh_to_arma3_skeleton(src, src_arm)
 
-        saved_pose = {}
-        if src_arm and src_arm.pose:
-            for pb in src_arm.pose.bones:
-                saved_pose[pb.name] = (
-                    pb.rotation_mode,
-                    tuple(pb.rotation_euler),
-                    tuple(pb.rotation_quaternion),
-                    tuple(pb.location),
-                )
-                pb.rotation_euler = (0.0, 0.0, 0.0)
-                pb.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
-                pb.location = (0.0, 0.0, 0.0)
+        prev_pose_pos = src_arm.data.pose_position if (src_arm and src_arm.data) else None
+        if src_arm and src_arm.data:
+            src_arm.data.pose_position = "REST"
 
         src_was_hidden = src.hide_get()
         src.hide_set(False)
         context.view_layer.update()
 
+        props = context.scene.ez_mod_props
         method_used = "Data Transfer"
         try:
-            # 1) Try Robust Weight Transfer with tolerant settings first
+            # 1) Try Robust Weight Transfer with proper normal & distance constraints
             rwt_ok = False
             if rwt is not None and hasattr(bpy.ops.object, "skin_weight_transfer"):
                 try:
@@ -3717,10 +3892,10 @@ class EZMOD_OT_sent_smart_transfer(bpy.types.Operator):
                     if hasattr(rwt, "group_selection"):
                         rwt.group_selection = "DEFORM_POSE_BONES" if src_arm else "ALL_GROUPS"
                     if hasattr(rwt, "max_distance"):
-                        rwt.max_distance = max(rwt.max_distance, 0.25)
+                        rwt.max_distance = 0.15
                     if hasattr(rwt, "max_normal_angle_difference"):
                         import math
-                        rwt.max_normal_angle_difference = math.pi
+                        rwt.max_normal_angle_difference = math.radians(75.0)
                     context.view_layer.update()
                     if bpy.ops.object.skin_weight_transfer.poll():
                         res = bpy.ops.object.skin_weight_transfer()
@@ -3730,7 +3905,7 @@ class EZMOD_OT_sent_smart_transfer(bpy.types.Operator):
                 except Exception:
                     rwt_ok = False
 
-            # 2) Reliable fallback: Blender Data Transfer (never fails on loose parts)
+            # 2) Reliable fallback: Blender Data Transfer
             if not rwt_ok:
                 dt_mod = obj.modifiers.new(name="SENT_DataTransfer", type="DATA_TRANSFER")
                 dt_mod.object = src
@@ -3742,28 +3917,20 @@ class EZMOD_OT_sent_smart_transfer(bpy.types.Operator):
                 bpy.ops.object.datalayout_transfer(modifier=dt_mod.name)
                 bpy.ops.object.modifier_apply(modifier=dt_mod.name)
 
-            if src_arm:
-                bind_mesh_to_arma3_skeleton(obj, src_arm)
+            # Slot-aware filtering, bilateral protection, 4 bones limit, and clean normalization
+            clean_and_normalize_gear_weights(
+                obj,
+                gear_type=props.gear_type,
+                bone_mode="AUTO",
+                protect_bilateral=True,
+                filter_slot=True,
+                arm_obj=src_arm,
+            )
 
-            if len(obj.vertex_groups) > 0:
-                sel_mode = "BONE_DEFORM" if src_arm else "ALL"
-                obj.vertex_groups.active_index = 0
-                bpy.ops.object.mode_set(mode="WEIGHT_PAINT")
-                bpy.ops.object.vertex_group_smooth(
-                    group_select_mode=sel_mode,
-                    factor=0.35,
-                    repeat=2,
-                    expand=0.0,
-                )
-                bpy.ops.object.vertex_group_limit_total(
-                    group_select_mode=sel_mode,
-                    limit=4,
-                )
-                bpy.ops.object.vertex_group_normalize_all(
-                    group_select_mode=sel_mode,
-                    lock_active=False,
-                )
-                bpy.ops.object.mode_set(mode="OBJECT")
+            target_arm = src_arm or bpy.data.objects.get("Arma3_Skeleton") or ensure_arma3_skeleton(context)
+            if target_arm:
+                bind_mesh_to_arma3_skeleton(obj, target_arm)
+
         finally:
             src.hide_set(src_was_hidden)
             if obj.mode != "OBJECT":
@@ -3771,14 +3938,9 @@ class EZMOD_OT_sent_smart_transfer(bpy.types.Operator):
                     bpy.ops.object.mode_set(mode="OBJECT")
                 except Exception:
                     pass
-            if src_arm and src_arm.pose and saved_pose:
-                for pb in src_arm.pose.bones:
-                    if pb.name in saved_pose:
-                        rmode, reul, rquat, rloc = saved_pose[pb.name]
-                        pb.rotation_mode = rmode
-                        pb.rotation_euler = reul
-                        pb.rotation_quaternion = rquat
-                        pb.location = rloc
+            if src_arm and src_arm.data and prev_pose_pos:
+                src_arm.data.pose_position = prev_pose_pos
+                context.view_layer.update()
 
         self.report({"INFO"}, f"Веса перенесены с '{src.name}' ({method_used})!")
         return {"FINISHED"}
@@ -3930,19 +4092,12 @@ class EZMOD_OT_transfer_from_mannequin(bpy.types.Operator):
             self.report({"ERROR"}, "Не найден меш Arma3_Mannequin!")
             return {"CANCELLED"}
 
-        # Save & temporarily reset pose so surface transfer happens in rest T-pose
-        saved_pose = {}
-        if arm and arm.pose:
-            for pb in arm.pose.bones:
-                saved_pose[pb.name] = (
-                    pb.rotation_mode,
-                    tuple(pb.rotation_euler),
-                    tuple(pb.rotation_quaternion),
-                    tuple(pb.location),
-                )
-                pb.rotation_euler = (0.0, 0.0, 0.0)
-                pb.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
-                pb.location = (0.0, 0.0, 0.0)
+        props = context.scene.ez_mod_props
+
+        # Force rest pose (T-pose) during transfer so bent pose never corrupts weights
+        prev_pose_pos = arm.data.pose_position if (arm and arm.data) else None
+        if arm and arm.data:
+            arm.data.pose_position = "REST"
 
         disabled_mods = []
         for m in obj.modifiers:
@@ -3956,7 +4111,7 @@ class EZMOD_OT_transfer_from_mannequin(bpy.types.Operator):
 
         try:
             for vg in list(obj.vertex_groups):
-                if vg.name.lower() in ARMA3_BONE_NAMES_SET or vg.name.lower().startswith("camo"):
+                if vg.name.lower() in ARMA3_BONE_NAMES_SET:
                     obj.vertex_groups.remove(vg)
 
             # Ensure mannequin has bone groups; if empty, load from MANNEQUIN_PATH
@@ -3972,7 +4127,7 @@ class EZMOD_OT_transfer_from_mannequin(bpy.types.Operator):
 
             _ensure_mannequin_finger_weights(mannequin)
 
-            # Use Blender's surface-interpolated Data Transfer (never fails on loose parts)
+            # Use Blender's surface-interpolated Data Transfer
             dt_mod = obj.modifiers.new(name="EZ_DataTransfer", type="DATA_TRANSFER")
             dt_mod.object = mannequin
             dt_mod.use_vert_data = True
@@ -3984,38 +4139,21 @@ class EZMOD_OT_transfer_from_mannequin(bpy.types.Operator):
             bpy.ops.object.datalayout_transfer(modifier=dt_mod.name)
             bpy.ops.object.modifier_apply(modifier=dt_mod.name)
 
-            # Remove non-bone groups that may have come from mannequin except bone groups
-            for vg in list(obj.vertex_groups):
-                if vg.name.lower() not in ARMA3_BONE_NAMES_SET:
-                    obj.vertex_groups.remove(vg)
-
             for m in disabled_mods:
                 m.show_viewport = True
 
             bind_mesh_to_arma3_skeleton(obj, arm)
 
-            if len(obj.vertex_groups) > 0:
-                obj.vertex_groups.active_index = 0
-                bpy.ops.object.mode_set(mode="WEIGHT_PAINT")
-                bpy.ops.object.vertex_group_smooth(
-                    group_select_mode="BONE_DEFORM",
-                    factor=0.45,
-                    repeat=3,
-                    expand=0.0,
-                )
-                bpy.ops.object.vertex_group_limit_total(
-                    group_select_mode="BONE_DEFORM",
-                    limit=4,
-                )
-                bpy.ops.object.vertex_group_normalize_all(
-                    group_select_mode="BONE_DEFORM",
-                    lock_active=False,
-                )
-                bpy.ops.object.mode_set(mode="OBJECT")
+            # Clean slot filtering, bilateral X protection, limit 4 bones, and clean normalize
+            clean_and_normalize_gear_weights(
+                obj,
+                gear_type=props.gear_type,
+                bone_mode="AUTO",
+                protect_bilateral=True,
+                filter_slot=True,
+                arm_obj=arm,
+            )
 
-            vg_camo = obj.vertex_groups.get("camo") or obj.vertex_groups.new(name="camo")
-            if len(obj.data.vertices) > 0:
-                vg_camo.add(list(range(len(obj.data.vertices))), 1.0, "REPLACE")
         finally:
             mannequin.hide_set(man_was_hidden)
             for m in disabled_mods:
@@ -4025,14 +4163,9 @@ class EZMOD_OT_transfer_from_mannequin(bpy.types.Operator):
                     bpy.ops.object.mode_set(mode="OBJECT")
                 except Exception:
                     pass
-            if arm and arm.pose and saved_pose:
-                for pb in arm.pose.bones:
-                    if pb.name in saved_pose:
-                        rmode, reul, rquat, rloc = saved_pose[pb.name]
-                        pb.rotation_mode = rmode
-                        pb.rotation_euler = reul
-                        pb.rotation_quaternion = rquat
-                        pb.location = rloc
+            if arm and arm.data and prev_pose_pos:
+                arm.data.pose_position = prev_pose_pos
+                context.view_layer.update()
 
         if hasattr(obj, "armaObjProps"):
             obj.armaObjProps.isArmaObject = True
@@ -4040,7 +4173,7 @@ class EZMOD_OT_transfer_from_mannequin(bpy.types.Operator):
         bones_list = ", ".join(
             vg.name for vg in obj.vertex_groups if vg.name.lower() in ARMA3_BONE_NAMES_SET
         )
-        self.report({"INFO"}, f"Веса перенесены с манекена! Кости: {bones_list}")
+        self.report({"INFO"}, f"Веса чисто перенесены с манекена! Кости: {bones_list}")
         return {"FINISHED"}
 
 
@@ -4064,19 +4197,10 @@ class EZMOD_OT_auto_rig_vest_rigid(bpy.types.Operator):
 
         arm = ensure_arma3_skeleton(context)
 
-        # Save & temporarily reset pose to get clean rest-pose coordinates
-        saved_pose = {}
-        if arm and arm.pose:
-            for pb in arm.pose.bones:
-                saved_pose[pb.name] = (
-                    pb.rotation_mode,
-                    tuple(pb.rotation_euler),
-                    tuple(pb.rotation_quaternion),
-                    tuple(pb.location),
-                )
-                pb.rotation_euler = (0.0, 0.0, 0.0)
-                pb.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
-                pb.location = (0.0, 0.0, 0.0)
+        # Force rest pose (T-pose) during calculation
+        prev_pose_pos = arm.data.pose_position if (arm and arm.data) else None
+        if arm and arm.data:
+            arm.data.pose_position = "REST"
 
         disabled_mods = []
         for m in obj.modifiers:
@@ -4085,71 +4209,126 @@ class EZMOD_OT_auto_rig_vest_rigid(bpy.types.Operator):
                 disabled_mods.append(m)
         context.view_layer.update()
 
-        # Find spine2 / spine3 Z bounds from Arma3_Skeleton rest bones
-        z_spine2 = 1.00
-        z_spine3 = 1.18
-        if arm and arm.data:
-            b2 = arm.data.bones.get("spine2")
-            b3 = arm.data.bones.get("spine3")
-            if b2:
-                z_spine2 = (arm.matrix_world @ b2.head_local).z
-            if b3:
-                z_spine3 = (arm.matrix_world @ b3.head_local).z
-        if z_spine3 <= z_spine2 + 0.02:
-            z_spine3 = z_spine2 + 0.15
+        try:
+            # Find spine2 / spine3 Z bounds from Arma3_Skeleton rest bones
+            z_spine2 = 1.00
+            z_spine3 = 1.18
+            if arm and arm.data:
+                b2 = arm.data.bones.get("spine2")
+                b3 = arm.data.bones.get("spine3")
+                if b2:
+                    z_spine2 = (arm.matrix_world @ b2.head_local).z
+                if b3:
+                    z_spine3 = (arm.matrix_world @ b3.head_local).z
+            if z_spine3 <= z_spine2 + 0.02:
+                z_spine3 = z_spine2 + 0.15
 
-        for vg in list(obj.vertex_groups):
-            if vg.name.lower() in ARMA3_BONE_NAMES_SET or vg.name.lower().startswith("camo"):
-                obj.vertex_groups.remove(vg)
+            for vg in list(obj.vertex_groups):
+                if vg.name.lower() in ARMA3_BONE_NAMES_SET:
+                    obj.vertex_groups.remove(vg)
 
-        vg_s3 = obj.vertex_groups.new(name="spine3")
-        vg_s2 = obj.vertex_groups.new(name="spine2")
-        vg_camo = obj.vertex_groups.new(name="camo")
+            vg_s3 = obj.vertex_groups.new(name="spine3")
+            vg_s2 = obj.vertex_groups.new(name="spine2")
+            vg_camo = obj.vertex_groups.get("camo") or obj.vertex_groups.new(name="camo")
 
-        mw = obj.matrix_world
-        all_idx = []
-        for vi, v in enumerate(obj.data.vertices):
-            all_idx.append(vi)
-            wz = (mw @ v.co).z
-            if wz >= z_spine3:
-                w3, w2 = 1.0, 0.0
-            elif wz <= z_spine2:
-                w3, w2 = 0.25, 0.75
-            else:
-                t = (wz - z_spine2) / (z_spine3 - z_spine2)
-                w3 = 0.25 + 0.75 * t
-                w2 = 1.0 - w3
-            vg_s3.add([vi], w3, "REPLACE")
-            if w2 > 0.001:
-                vg_s2.add([vi], w2, "REPLACE")
-        if all_idx:
-            vg_camo.add(all_idx, 1.0, "REPLACE")
+            mw = obj.matrix_world
+            all_idx = []
+            for vi, v in enumerate(obj.data.vertices):
+                all_idx.append(vi)
+                wz = (mw @ v.co).z
+                if wz >= z_spine3:
+                    w3, w2 = 1.0, 0.0
+                elif wz <= z_spine2:
+                    w3, w2 = 0.25, 0.75
+                else:
+                    t = (wz - z_spine2) / (z_spine3 - z_spine2)
+                    w3 = 0.25 + 0.75 * t
+                    w2 = 1.0 - w3
+                vg_s3.add([vi], w3, "REPLACE")
+                if w2 > 0.001:
+                    vg_s2.add([vi], w2, "REPLACE")
+            if all_idx:
+                vg_camo.add(all_idx, 1.0, "REPLACE")
 
-        for m in disabled_mods:
-            m.show_viewport = True
+            for m in disabled_mods:
+                m.show_viewport = True
 
-        bind_mesh_to_arma3_skeleton(obj, arm)
+            bind_mesh_to_arma3_skeleton(obj, arm)
+            normalize_and_limit_bone_weights(obj, max_bones=4)
 
-        if arm and arm.pose and saved_pose:
-            for pb in arm.pose.bones:
-                if pb.name in saved_pose:
-                    rmode, reul, rquat, rloc = saved_pose[pb.name]
-                    pb.rotation_mode = rmode
-                    pb.rotation_euler = reul
-                    pb.rotation_quaternion = rquat
-                    pb.location = rloc
+        finally:
+            if arm and arm.data and prev_pose_pos:
+                arm.data.pose_position = prev_pose_pos
+                context.view_layer.update()
 
         if hasattr(obj, "armaObjProps"):
             obj.armaObjProps.isArmaObject = True
 
-        self.report({"INFO"}, "Плитник привязан жёстко (spine3 + spine2, без плеч)!")
+        self.report({"INFO"}, "Плитник привязан жёстко (spine3 + spine2, без вытягивания плечами)!")
         return {"FINISHED"}
+
+
+class EZMOD_OT_purge_alien_bones(bpy.types.Operator):
+    bl_idname = "ezmod.purge_alien_bones"
+    bl_label = "🧹 Вычистить чужие кости (Valve/CoD/CC)"
+    bl_description = "Удаляет все не-Arma 3 группы вершин (ValveBiped, CC_Base, j_, mixamorig), мёртвые модификаторы и очищает меш от мусора"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = _resolve_target_gear_mesh(context)
+        if not obj:
+            self.report({"ERROR"}, "Выделите 3D-модель (Mesh)!")
+            return {"CANCELLED"}
+        removed = 0
+        for vg in list(obj.vertex_groups):
+            vgl = vg.name.lower()
+            if vgl not in ARMA3_BONE_NAMES_SET and not vgl.startswith("camo"):
+                obj.vertex_groups.remove(vg)
+                removed += 1
+        for m in list(obj.modifiers):
+            if m.type == "ARMATURE" and m.object is None:
+                obj.modifiers.remove(m)
+        self.report({"INFO"}, f"Удалено {removed} чужих групп вершин! Меш очищен.")
+        return {"FINISHED"}
+
+
+class EZMOD_OT_ultimate_auto_rig(bpy.types.Operator):
+    bl_idname = "ezmod.ultimate_auto_rig"
+    bl_label = "🚀 1 Клик: УЛЬТИМАТИВНЫЙ РИГ"
+    bl_description = "Ультимативное решение: вычищает все чужие кости (Valve/CoD/CC), удаляет битые модификаторы, сажает модель на скелет Arma 3 (по правилам слота), переносит эталонные веса и нормализует"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = _resolve_target_gear_mesh(context)
+        if not obj:
+            self.report({"ERROR"}, "Выделите 3D-модель (Mesh)!")
+            return {"CANCELLED"}
+
+        # 1. Clean alien bone groups and dead modifiers first
+        for vg in list(obj.vertex_groups):
+            vgl = vg.name.lower()
+            if vgl not in ARMA3_BONE_NAMES_SET and not vgl.startswith("camo"):
+                obj.vertex_groups.remove(vg)
+        for m in list(obj.modifiers):
+            if m.type == "ARMATURE" and m.object is None:
+                obj.modifiers.remove(m)
+
+        props = context.scene.ez_mod_props
+        gear = props.gear_type
+
+        # 2. Route by slot:
+        if gear in ("HEADGEAR", "GOGGLES", "FACE", "NVG"):
+            return bpy.ops.ezmod.auto_rig()
+        elif gear == "VEST":
+            return bpy.ops.ezmod.auto_rig_vest_rigid()
+        else:
+            return bpy.ops.ezmod.transfer_from_mannequin()
 
 
 class EZMOD_OT_smooth_weights(bpy.types.Operator):
     bl_idname = "ezmod.smooth_weights"
     bl_label = "✨ 2. Сгладить веса (Smooth)"
-    bl_description = "Сглаживает веса костей, ограничивает до 4 костей на вершину (стандарт Arma 3) и нормализует"
+    bl_description = "Мягко сглаживает веса костей, ограничивает до 4 костей на вершину (стандарт Arma 3) и нормализует"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -4167,36 +4346,49 @@ class EZMOD_OT_smooth_weights(bpy.types.Operator):
         if len(obj.vertex_groups) == 0:
             self.report({"WARNING"}, "У модели нет групп вершин (сначала нажми Перенести веса / Плитник)!")
             return {"CANCELLED"}
+
+        # Temporarily drop camo before smoothing so it is not smoothed or normalized
+        vg_camo = obj.vertex_groups.get("camo")
+        camo_was_present = vg_camo is not None
+        if camo_was_present:
+            obj.vertex_groups.remove(vg_camo)
+
         try:
             if obj.vertex_groups.active_index < 0:
                 obj.vertex_groups.active_index = 0
             if obj.mode != "WEIGHT_PAINT":
                 bpy.ops.object.mode_set(mode="WEIGHT_PAINT")
             bpy.ops.object.vertex_group_smooth(
-                group_select_mode="BONE_DEFORM",
-                factor=0.5,
-                repeat=3,
+                group_select_mode="ALL",
+                factor=0.25,
+                repeat=1,
                 expand=0.0,
             )
-            bpy.ops.object.vertex_group_limit_total(
-                group_select_mode="BONE_DEFORM",
-                limit=4,
-            )
-            bpy.ops.object.vertex_group_normalize_all(
-                group_select_mode="BONE_DEFORM",
-                lock_active=False,
-            )
-            if prev_mode != "WEIGHT_PAINT":
-                bpy.ops.object.mode_set(mode="OBJECT")
-        except Exception as exc:
-            if obj.mode != "OBJECT" and prev_mode != "WEIGHT_PAINT":
+        except Exception:
+            pass
+        finally:
+            if obj.mode != "OBJECT":
                 try:
                     bpy.ops.object.mode_set(mode="OBJECT")
                 except Exception:
                     pass
-            self.report({"WARNING"}, f"Не удалось сгладить веса: {exc}")
-            return {"CANCELLED"}
-        self.report({"INFO"}, "Веса сглажены и нормализованы (макс. 4 кости на вершину)!")
+
+        props = getattr(context.scene, "ez_mod_props", None)
+        gear_type = props.gear_type if props else "UNIFORM"
+        arm = bpy.data.objects.get("Arma3_Skeleton")
+        clean_and_normalize_gear_weights(
+            obj,
+            gear_type=gear_type,
+            bone_mode="AUTO",
+            protect_bilateral=True,
+            filter_slot=True,
+            arm_obj=arm,
+        )
+
+        if prev_mode == "WEIGHT_PAINT":
+            bpy.ops.object.mode_set(mode="WEIGHT_PAINT")
+
+        self.report({"INFO"}, "Веса мягко сглажены, ограничены (макс. 4 кости) и нормализованы!")
         return {"FINISHED"}
 
 
@@ -4260,11 +4452,37 @@ def draw_ps_brush_context_menu(self, context):
     if obj and obj.type == "MESH":
         vg = obj.vertex_groups.active
         b_box = box.box()
-        row_bone = b_box.row()
-        row_bone.label(text=f"Кость: {vg.name if vg else 'Не выбрана'}", icon="BONE_DATA")
+        row_bone = b_box.row(align=True)
+        if vg:
+            row_bone.label(text=f"Кость: {vg.name}", icon="BONE_DATA")
+        else:
+            row_bone.label(text="Кость не выбрана", icon="BONE_DATA")
         row_bone.label(text="(Ctrl+ЛКМ = клик по кости)", icon="INFO")
 
-    # Защита от брака
+        if vg:
+            row_lock_cur = b_box.row(align=True)
+            row_lock_cur.scale_y = 1.15
+            is_locked = vg.lock_weight
+            row_lock_cur.prop(
+                vg,
+                "lock_weight",
+                text=f"🔒 {vg.name} ЗАЛОЧЕНА" if is_locked else f"🔓 {vg.name} ОТКРЫТА (клик = залочить)",
+                toggle=True,
+                icon="LOCKED" if is_locked else "UNLOCKED",
+            )
+
+        row_locks = b_box.row(align=True)
+        row_locks.operator("ezmod.lock_all_other_bones", text="🔒 Залочить ВСЕ ДРУГИЕ", icon="LOCKED")
+        row_locks.operator("ezmod.unlock_all_bones", text="🔓 Разлочить всё", icon="UNLOCKED")
+
+        row_auto = b_box.row(align=True)
+        row_auto.scale_y = 1.25
+        row_auto.operator("ezmod.quick_autoweight_finger", text="⚡ Автовес (палец / выделенные кости)", icon="MOD_ARMATURE")
+    row_iso = box.row(align=True)
+    row_iso.scale_y = 1.25
+    row_iso.operator("ezmod.isolate_selected_mesh", text="🎯 Изолировать (Shift+H)", icon="RESTRICT_VIEW_OFF")
+    row_iso.operator("ezmod.unhide_mesh", text="👁 Показать всё (Alt+H)", icon="HIDE_OFF")
+
     row_safe = box.row(align=True)
     if brush and hasattr(brush, "use_frontface"):
         row_safe.prop(brush, "use_frontface", text="Не насквозь", toggle=True, icon="HIDE_OFF")
@@ -4272,16 +4490,6 @@ def draw_ps_brush_context_menu(self, context):
         row_safe.prop(ts, "use_auto_normalize", text="Авто-норм.", toggle=True, icon="NORMALIZE_FCURVES")
     if obj and hasattr(obj.data, "use_mirror_x"):
         row_safe.prop(obj.data, "use_mirror_x", text="X", toggle=True)
-
-    row_arma_m = box.row(align=True)
-    row_arma_m.operator("ezmod.auto_generate_lods", text="⚡ Авто-Лодинг", icon="MOD_DECIM")
-    has_empty_vp = bool(bpy.data.objects.get("LOD_View_Pilot_Empty"))
-    row_arma_m.operator(
-        "ezmod.toggle_first_person_hide",
-        text="👁 1-е лицо: Скрыто" if has_empty_vp else "👁 1-е лицо: Видно",
-        icon="HIDE_ON" if has_empty_vp else "HIDE_OFF",
-        depress=has_empty_vp,
-    )
 
     box.separator()
 
@@ -4317,9 +4525,12 @@ class ATBX_PT_ez_sent_lazy_panel(bpy.types.Panel):
         # --- Fast Transfer ---
         col = layout.column(align=True)
         col.scale_y = 1.2
+        col.operator("ezmod.ultimate_auto_rig", text="🚀 1 Клик: УЛЬТИМАТИВНЫЙ РИГ", icon="AUTO")
+        col.operator("ezmod.purge_alien_bones", text="🧹 Снять чужие кости (Valve/CoD/CC)", icon="TRASH")
         col.operator("ezmod.sent_smart_transfer", text="⚡ Перенести с Source (весь)", icon="MOD_DATA_TRANSFER")
         col.operator("ezmod.sent_transfer_selected", text="✂ Перенести ТОЛЬКО на выделенное", icon="RESTRICT_SELECT_OFF")
         col.operator("ezmod.transfer_from_mannequin", text="🧍 Перенести с манекена Arma 3", icon="OUTLINER_OB_ARMATURE")
+        col.operator("ezmod.auto_rig_vest_rigid", text="🛡 Плитник жёстко (spine3 + spine2, без рук)", icon="SHIELD")
 
         # --- Weight Paint Photoshop Suite (no tab switching!) ---
         if context.mode == "PAINT_WEIGHT":
@@ -4420,7 +4631,237 @@ class EZMOD_PT_dedicated_tab_panel(bpy.types.Panel):
         draw_ez_mod_ui(self.layout, context)
 
 
+
+
+class EZMOD_OT_isolate_selected_mesh(bpy.types.Operator):
+    bl_idname = "ezmod.isolate_selected_mesh"
+    bl_label = "🎯 Изолировать выделенное и красить"
+    bl_description = "Скрывает всё невыделенное, оставляет только нужный палец/деталь и переходит в Weight Paint + Pose Mode"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = context.object
+        if not obj or obj.type != "MESH":
+            self.report({"WARNING"}, "Выберите меш объект!")
+            return {"CANCELLED"}
+
+        arm_obj = None
+        for mod in obj.modifiers:
+            if mod.type == "ARMATURE" and mod.object:
+                arm_obj = mod.object
+                break
+        if not arm_obj and obj.parent and obj.parent.type == "ARMATURE":
+            arm_obj = obj.parent
+
+        if obj.mode == "EDIT":
+            bpy.ops.mesh.hide(unselected=True)
+            bpy.ops.object.mode_set(mode="OBJECT")
+        elif obj.mode == "WEIGHT_PAINT":
+            bpy.ops.object.mode_set(mode="EDIT")
+            bpy.ops.mesh.hide(unselected=True)
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        if arm_obj:
+            bpy.ops.object.select_all(action="DESELECT")
+            arm_obj.select_set(True)
+            context.view_layer.objects.active = arm_obj
+            try:
+                bpy.ops.object.mode_set(mode="POSE")
+            except Exception:
+                pass
+
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode="WEIGHT_PAINT")
+        else:
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode="WEIGHT_PAINT")
+
+        obj.data.use_paint_mask_vertex = True
+        self.report({"INFO"}, "🎯 Выделенное изолировано! Виден только нужный кусок для покраски.")
+        return {"FINISHED"}
+
+
+class EZMOD_OT_unhide_mesh(bpy.types.Operator):
+    bl_idname = "ezmod.unhide_mesh"
+    bl_label = "👁 Показать всё (Сбросить изоляцию)"
+    bl_description = "Возвращает всю модель на экран"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = context.object
+        if not obj or obj.type != "MESH":
+            self.report({"WARNING"}, "Выберите меш объект!")
+            return {"CANCELLED"}
+
+        prev_mode = obj.mode
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.ops.mesh.reveal()
+
+        if prev_mode == "WEIGHT_PAINT":
+            bpy.ops.object.mode_set(mode="WEIGHT_PAINT")
+            obj.data.use_paint_mask_vertex = False
+        else:
+            bpy.ops.object.mode_set(mode=prev_mode)
+
+        self.report({"INFO"}, "👁 Вся модель снова видна!")
+        return {"FINISHED"}
+
+
+def draw_edit_mesh_isolate_menu(self, context):
+    layout = self.layout
+    layout.separator()
+    layout.operator("ezmod.isolate_selected_mesh", text="🎯 Изолировать и красить веса (Shift+H)", icon="BRUSH_DATA")
+    layout.operator("ezmod.unhide_mesh", text="👁 Показать всё (Alt+H)", icon="HIDE_OFF")
+
+
+class EZMOD_OT_lock_all_other_bones(bpy.types.Operator):
+    bl_idname = "ezmod.lock_all_other_bones"
+    bl_label = "🔒 Залочить остальные кости"
+    bl_description = "Блокирует все группы вершин кроме активной, чтобы их веса случайно не стёрлись"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = context.object
+        if not obj or obj.type != "MESH":
+            return {"CANCELLED"}
+        active_vg = obj.vertex_groups.active
+        count = 0
+        for g in obj.vertex_groups:
+            if g != active_vg:
+                g.lock_weight = True
+                count += 1
+            else:
+                g.lock_weight = False
+        self.report({"INFO"}, f"🔒 Заблокировано {count} групп! Активная: {active_vg.name if active_vg else ''}")
+        return {"FINISHED"}
+
+
+class EZMOD_OT_unlock_all_bones(bpy.types.Operator):
+    bl_idname = "ezmod.unlock_all_bones"
+    bl_label = "🔓 Разлочить все кости"
+    bl_description = "Снимает блокировку со всех костей"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = context.object
+        if not obj or obj.type != "MESH":
+            return {"CANCELLED"}
+        for g in obj.vertex_groups:
+            g.lock_weight = False
+        self.report({"INFO"}, "🔓 Все кости разблокированы!")
+        return {"FINISHED"}
+
+
+class EZMOD_OT_quick_autoweight_finger(bpy.types.Operator):
+    bl_idname = "ezmod.quick_autoweight_finger"
+    bl_label = "⚡ Автовес (выбранные кости / палец)"
+    bl_description = "Автоматически и чисто рассчитывает веса для выбранных костей (или фаланг пальца), блокируя остальные группы от порчи"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = context.object
+        if not obj or obj.type != "MESH":
+            self.report({"WARNING"}, "Выберите меш объект!")
+            return {"CANCELLED"}
+
+        arm_obj = None
+        for mod in obj.modifiers:
+            if mod.type == "ARMATURE" and mod.object:
+                arm_obj = mod.object
+                break
+        if not arm_obj and obj.parent and obj.parent.type == "ARMATURE":
+            arm_obj = obj.parent
+
+        if not arm_obj:
+            self.report({"ERROR"}, "Скелет (Armature) не найден!")
+            return {"CANCELLED"}
+
+        vg = obj.vertex_groups.active
+        target_bones = []
+
+        # 1. Если пользователь выделил 2+ кости в Pose Mode вручную - работаем с ними
+        if arm_obj.pose:
+            user_selected = [pb.name for pb in arm_obj.pose.bones if pb.select]
+            if len(user_selected) > 1:
+                target_bones = user_selected
+
+        # 2. Иначе определяем по активной кости/группе
+        if not target_bones:
+            if not vg:
+                self.report({"WARNING"}, "Выберите кость в списке или через Ctrl+ЛКМ!")
+                return {"CANCELLED"}
+
+            bname = vg.name.lower()
+            finger_keywords = ['thumb', 'index', 'middle', 'ring', 'pinky', 'little', 'finger', 'digit']
+            found_kw = None
+            for kw in finger_keywords:
+                if kw in bname:
+                    found_kw = kw
+                    break
+
+            is_left = any(x in bname for x in ['left', 'l_', '_l', '.l', 'bip01_l'])
+            is_right = any(x in bname for x in ['right', 'r_', '_r', '.r', 'bip01_r'])
+            side = 'left' if is_left else ('right' if is_right else None)
+
+            if found_kw and arm_obj.pose:
+                for pb in arm_obj.pose.bones:
+                    bn_low = pb.name.lower()
+                    if found_kw in bn_low:
+                        if side == 'left' and any(x in bn_low for x in ['left', 'l_', '_l', '.l', 'bip01_l']):
+                            target_bones.append(pb.name)
+                        elif side == 'right' and any(x in bn_low for x in ['right', 'r_', '_r', '.r', 'bip01_r']):
+                            target_bones.append(pb.name)
+                        elif side is None:
+                            target_bones.append(pb.name)
+
+            if not target_bones:
+                target_bones = [vg.name]
+
+        # 3. Защита: блокируем ВСЕ остальные группы вершин, чтобы автовес не портил остальную модель
+        for g in obj.vertex_groups:
+            if g.name not in target_bones:
+                g.lock_weight = True
+            else:
+                g.lock_weight = False
+
+        # 4. В Pose Mode выделяем строго нужные кости (совместимо с Blender 4.0 - 5.1+)
+        if arm_obj.pose:
+            for pb in arm_obj.pose.bones:
+                pb.select = (pb.name in target_bones)
+            if target_bones[0] in arm_obj.data.bones:
+                arm_obj.data.bones.active = arm_obj.data.bones[target_bones[0]]
+
+        # 5. Убеждаемся, что скелет и меш выбраны корректно для paint.weight_from_bones
+        arm_obj.select_set(True)
+        if arm_obj.mode != "POSE":
+            try:
+                context.view_layer.objects.active = arm_obj
+                bpy.ops.object.mode_set(mode="POSE")
+            except Exception:
+                pass
+
+        context.view_layer.objects.active = obj
+        obj.select_set(True)
+        if obj.mode != "WEIGHT_PAINT":
+            bpy.ops.object.mode_set(mode="WEIGHT_PAINT")
+
+        # 6. Запускаем встроенный автовес Blender
+        try:
+            bpy.ops.paint.weight_from_bones(type='AUTOMATIC')
+            self.report({"INFO"}, f"⚡ Рассчитан автовес ({len(target_bones)} костей): {', '.join(target_bones)}")
+        except Exception as exc:
+            self.report({"WARNING"}, f"Ошибка автовеса: {exc}")
+
+        return {"FINISHED"}
+
 classes = (
+    EZMOD_OT_lock_all_other_bones,
+    EZMOD_OT_unlock_all_bones,
+    EZMOD_OT_quick_autoweight_finger,
+    EZMOD_OT_isolate_selected_mesh,
+    EZMOD_OT_unhide_mesh,
     EZModAceaxValueItem,
     EZModAceaxOptionItem,
     EZModProperties,
@@ -4449,6 +4890,8 @@ classes = (
     EZMOD_OT_auto_fit_gloves,
     EZMOD_OT_auto_rig,
     EZMOD_OT_auto_rig_vest_rigid,
+    EZMOD_OT_purge_alien_bones,
+    EZMOD_OT_ultimate_auto_rig,
     EZMOD_OT_smooth_weights,
     EZMOD_OT_fix_multi_uv,
     EZMOD_OT_adapt_dxt5nm_normals,
@@ -4515,6 +4958,11 @@ def register():
             bpy.types.VIEW3D_PT_paint_weight_context_menu.prepend(draw_ps_brush_context_menu)
         except Exception:
             pass
+    if hasattr(bpy.types, "VIEW3D_MT_edit_mesh_context_menu"):
+        try:
+            bpy.types.VIEW3D_MT_edit_mesh_context_menu.prepend(draw_edit_mesh_isolate_menu)
+        except Exception:
+            pass
     try:
         register_ps_keymaps()
     except Exception:
@@ -4526,6 +4974,11 @@ def unregister():
         unregister_ps_keymaps()
     except Exception:
         pass
+    if hasattr(bpy.types, "VIEW3D_MT_edit_mesh_context_menu"):
+        try:
+            bpy.types.VIEW3D_MT_edit_mesh_context_menu.remove(draw_edit_mesh_isolate_menu)
+        except Exception:
+            pass
     if hasattr(bpy.types, "VIEW3D_PT_paint_weight_context_menu"):
         try:
             bpy.types.VIEW3D_PT_paint_weight_context_menu.remove(draw_ps_brush_context_menu)
